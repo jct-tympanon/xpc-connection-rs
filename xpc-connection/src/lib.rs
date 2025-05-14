@@ -1,6 +1,5 @@
 #[allow(
     dead_code,
-    safe_packed_borrows,
     non_upper_case_globals,
     non_camel_case_types,
     non_snake_case,
@@ -8,20 +7,22 @@
 )]
 extern crate xpc_connection_sys;
 
+mod channel;
 mod message;
 pub use message::*;
+pub use channel::*;
 
 use block::ConcreteBlock;
 use futures::{
     channel::mpsc::{unbounded as unbounded_channel, UnboundedReceiver, UnboundedSender},
     Stream,
 };
-use std::ffi::CStr;
+use std::{ffi::CStr, sync::Arc};
 use std::{ffi::c_void, ops::Deref};
 use std::{pin::Pin, task::Poll};
 use xpc_connection_sys::{
     xpc_connection_cancel, xpc_connection_create_mach_service, xpc_connection_resume,
-    xpc_connection_send_message, xpc_connection_set_event_handler, xpc_connection_t, xpc_object_t,
+    xpc_connection_set_event_handler, xpc_connection_t, xpc_object_t,
     xpc_release, XPC_CONNECTION_MACH_SERVICE_LISTENER, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED,
 };
 
@@ -56,7 +57,7 @@ fn cancel_and_wait_for_event_handler(connection: xpc_connection_t) {
 pub struct XpcListener {
     connection: xpc_connection_t,
     receiver: UnboundedReceiver<XpcClient>,
-    sender: UnboundedSender<XpcClient>,
+    _sender: UnboundedSender<XpcClient>,
 }
 
 impl PartialEq for XpcListener {
@@ -109,7 +110,7 @@ impl XpcListener {
         XpcListener {
             connection,
             receiver,
-            sender,
+            _sender: sender,
         }
     }
 
@@ -125,47 +126,27 @@ impl XpcListener {
 
 #[derive(Debug)]
 pub struct XpcClient {
-    connection: xpc_connection_t,
-    event_handler_is_running: bool,
-    receiver: UnboundedReceiver<Message>,
-    sender: UnboundedSender<Message>,
+    connection: Arc<DuplexConnection>,
+    sender: XpcSender,
+    receiver: XpcReceiver,
 }
 
 unsafe impl Send for XpcClient {}
 
 impl PartialEq for XpcClient {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.connection, other.connection)
-    }
-}
-
-impl Drop for XpcClient {
-    fn drop(&mut self) {
-        if self.event_handler_is_running {
-            cancel_and_wait_for_event_handler(self.connection);
-        }
-
-        unsafe { xpc_release(self.connection as xpc_object_t) };
+        std::ptr::eq(**self.connection, **other.connection)
     }
 }
 
 impl Stream for XpcClient {
     type Item = Message;
 
-    /// `Poll::Ready(None)` returned in place of `MessageError::ConnectionInvalid`
-    /// as it's not recoverable. `MessageError::ConnectionInterrupted` should
-    /// be treated as recoverable.
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        match Stream::poll_next(Pin::new(&mut self.receiver), cx) {
-            Poll::Ready(Some(Message::Error(MessageError::ConnectionInvalid))) => {
-                self.event_handler_is_running = false;
-                Poll::Ready(None)
-            }
-            v => v,
-        }
+        Stream::poll_next(Pin::new(&mut self.receiver), cx)
     }
 }
 
@@ -192,12 +173,14 @@ impl XpcClient {
             xpc_connection_resume(connection);
         }
 
-        XpcClient {
-            connection,
-            event_handler_is_running: true,
-            receiver,
-            sender,
-        }
+        let connection = Arc::new(DuplexConnection::new(connection, true));
+        let receiver = XpcReceiver::new(connection.clone(), receiver, sender);
+        let sender = XpcSender::new(connection.clone());
+        XpcClient { connection, receiver, sender }
+    }
+
+    pub fn into_channel(self) -> (XpcSender, XpcReceiver) {
+        (self.sender, self.receiver)
     }
 
     /// The connection isn't established until the first call to `send_message`.
@@ -214,11 +197,7 @@ impl XpcClient {
     /// may receive an error relating to an invalid mach port name or a variety
     /// of other issues.
     pub fn send_message(&self, message: Message) {
-        let xpc_object = message_to_xpc_object(message);
-        unsafe {
-            xpc_connection_send_message(self.connection, xpc_object);
-            xpc_release(xpc_object);
-        }
+        self.sender.send_message(message)
     }
 
     #[cfg(feature = "audit_token")]
@@ -234,7 +213,7 @@ impl XpcClient {
 
         unsafe {
             xpc_connection_get_audit_token(
-                self.connection as xpc_connection_t,
+                **self.connection as xpc_connection_t,
                 token_buffer.as_mut_ptr() as _,
             )
         }
@@ -260,7 +239,7 @@ mod tests {
         // Cancelling the connection will cause the event handler to be called
         // with an error message. This will happen under normal circumstances,
         // for example if the service invalidates the connection.
-        unsafe { xpc_connection_cancel(client.connection) };
+        unsafe { xpc_connection_cancel(**client.connection) };
 
         if let Some(message) = block_on(client.next()) {
             panic!("Expected `None`, but received {:?}", message);
@@ -305,7 +284,7 @@ mod tests {
                     count += 1;
 
                     // Explained in `event_handler_receives_error_on_close`.
-                    unsafe { xpc_connection_cancel(client.connection) };
+                    unsafe { xpc_connection_cancel(**client.connection) };
                 }
                 None => {
                     // We can't be sure how many buffered messages we'll receive

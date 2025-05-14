@@ -215,7 +215,7 @@ pub fn xpc_object_to_message(xpc_object: xpc_object_t) -> Message {
 pub fn message_to_xpc_object(message: Message) -> xpc_object_t {
     match message {
         Message::Bool(bool) => unsafe { xpc_bool_create(bool) },
-        Message::Client(client) => client.connection as xpc_object_t,
+        Message::Client(client) => **client.connection as xpc_object_t,
         Message::Date(date) => unsafe {
             xpc_date_create(if date >= SystemTime::UNIX_EPOCH {
                 date.duration_since(SystemTime::UNIX_EPOCH)
