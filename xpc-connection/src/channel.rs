@@ -16,7 +16,15 @@ pub(crate) struct DuplexConnection {
     connection: xpc_connection_t,
     event_handler_is_running: AtomicBool,
 }
+
+// thread safety notes:
+// - Arc and AtomicBool are explicitly thread safe
+// - the internal raw pointer xpc_connection_t is safe to share between threads
+// - xpc_connection_send_message is probably thread-safe, as it is ["safe to call from multiple GCD queues"](https://developer.apple.com/documentation/xpc/xpc_connection_send_message(_:_:)?language=objc)
+// - all other operations on xpc_connection_t are called from create or Drop functions which are exclusive
 unsafe impl Send for DuplexConnection {}
+unsafe impl Sync for DuplexConnection {}
+
 impl DuplexConnection {
     pub(crate) fn new(connection: xpc_connection_t, event_handler_is_running: bool) -> Self {
         Self { connection, event_handler_is_running: AtomicBool::new(event_handler_is_running) }
