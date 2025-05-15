@@ -16,6 +16,7 @@ pub(crate) struct DuplexConnection {
     connection: xpc_connection_t,
     event_handler_is_running: AtomicBool,
 }
+unsafe impl Send for DuplexConnection {}
 impl DuplexConnection {
     pub(crate) fn new(connection: xpc_connection_t, event_handler_is_running: bool) -> Self {
         Self { connection, event_handler_is_running: AtomicBool::new(event_handler_is_running) }
